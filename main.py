@@ -77,7 +77,7 @@ class CZIAnalyzerApp:
         self._last_height = None
         self.root.minsize(800, 600)
         self.root.bind("<Configure>", self.on_resize)
-        self.channel = 0
+        self.GUVchannel = 0
         self.dye_channel = 0
 
         self.create_widgets()
@@ -95,7 +95,7 @@ class CZIAnalyzerApp:
             iid = selected[0]
             kind = iid.split("::", 1)[0]  # "file" | "sample" | "time"
             if kind == "time":
-                _, file_, sample, channel, dye_channel, time_point = iid.split("::")  # ["time", file, sample, guv, dye, t]
+                _, file_, sample, guv_channel, dye_channel, time_point = iid.split("::")  # ["time", file, sample, guv, dye, t]
                 # Prevent frequent updates using debouncing
                 current_time = time.time()
                 if hasattr(self, "_last_resize_time"):
@@ -113,7 +113,7 @@ class CZIAnalyzerApp:
                 self._last_width = new_width
                 self._last_height = new_height
 
-                self.show_image(file_, sample, channel, dye_channel, time_point)
+                self.show_image(file_, sample, guv_channel, dye_channel, time_point)
     ""
     def create_widgets(self):
         # Left side: all UI elements except the image
@@ -225,18 +225,21 @@ class CZIAnalyzerApp:
         self.center_distance_tolerance_rel_entry.insert(0, "0.1")
         i_row+=1
 
-        options = ["All channels", "Channel 1", "Channel 2"]
         self.ch_guv_combo_var = tk.StringVar(value="All channels")
-        self.ch_guv_combo = ttk.Combobox(middle_frame, textvariable=self.ch_guv_combo_var, values=options, state="readonly")
+        self.ch_guv_combo = ttk.Combobox(middle_frame, textvariable=self.ch_guv_combo_var, state="readonly")
         self.ch_guv_combo.bind("<<ComboboxSelected>>", self.on_change_guv_channel)
         self.ch_guv_combo.grid(row=i_row, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         i_row+=1
 
         self.ch_dye_combo_var = tk.StringVar(value="All channels")
-        self.ch_dye_combo = ttk.Combobox(middle_frame, textvariable=self.ch_dye_combo_var, values=options, state="readonly")
+        self.ch_dye_combo = ttk.Combobox(middle_frame, textvariable=self.ch_dye_combo_var, state="readonly")
         self.ch_dye_combo.bind("<<ComboboxSelected>>", self.on_change_dye_channel)
         self.ch_dye_combo.grid(row=i_row, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         i_row+=1
+
+        self.GUV_channels.bind("<FocusOut>", self.update_channel_comboboxes)
+        self.dye_channels.bind("<FocusOut>", self.update_channel_comboboxes)
+        self.update_channel_comboboxes()
 
         # Button for analysis
         self.analyze_button = tk.Button(middle_frame, text="Analyze", command=self.analyze_files)
@@ -287,19 +290,19 @@ class CZIAnalyzerApp:
             sample_iid = self.tree.parent(channel_iid)
             file_iid = self.tree.parent(sample_iid)
 
-            _, file_, sample, channel, dye_channel, t = iid.split("::")  # ["time", file, sample, guv, dye, t]
+            _, file_, sample, guv_channel, dye_channel, t = iid.split("::")  # ["time", file, sample, guv, dye, t]
             t = int(t)
-            intensity = self.dye_intensity_results[file_][int(sample)][int(channel)][int(dye_channel)]["average_intensity"][t]
+            intensity = self.dye_intensity_results[file_][int(sample)][int(guv_channel)][int(dye_channel)]["average_intensity"][t]
             print("file_", file_)
-            self.show_image(file_, sample, channel, dye_channel, t)
+            self.show_image(file_, sample, guv_channel, dye_channel, t)
 
         elif kind == "guvchannel":
-            _, file_, sample, channel = iid.split("::")
-            print(f"GUV channel {channel} in sample {sample} of file {file_} selected")
+            _, file_, sample, guv_channel = iid.split("::")
+            print(f"GUV channel {guv_channel} in sample {sample} of file {file_} selected")
 
         elif kind == "dyechannel":
-            _, file_, sample, channel, dye_channel = iid.split("::")
-            print(f"Dye channel {dye_channel} in GUV channel {channel} of sample {sample} in file {file_} selected")
+            _, file_, sample, guv_channel, dye_channel = iid.split("::")
+            print(f"Dye channel {dye_channel} in GUV channel {guv_channel} of sample {sample} in file {file_} selected")
 
         elif kind == "sample":
             # sample clicked
@@ -312,13 +315,13 @@ class CZIAnalyzerApp:
             print(f"File {file_} selected")
 
     # Displays the saved image for the selected file and time
-    def show_image(self, file, sample, channel, dye_channel, time):
+    def show_image(self, file, sample, GUVchannel, dye_channel, time):
         selected_time_point = int(time)
         sample = int(sample)
-        channel = int(channel)
+        GUVchannel = int(GUVchannel)
         dye_channel = int(dye_channel)
-        if file in self.image_results and sample in self.image_results[file] and channel in self.image_results[file][sample] and dye_channel in self.image_results[file][sample][channel] and selected_time_point in self.image_results[file][sample][channel][dye_channel]:
-            image = self.image_results[file][sample][channel][dye_channel][selected_time_point]
+        if file in self.image_results and sample in self.image_results[file] and GUVchannel in self.image_results[file][sample] and dye_channel in self.image_results[file][sample][GUVchannel] and selected_time_point in self.image_results[file][sample][GUVchannel][dye_channel]:
+            image = self.image_results[file][sample][GUVchannel][dye_channel][selected_time_point]
             img = Image.fromarray(image)
 
             # Wait until the label is visible to get the correct size
@@ -348,21 +351,45 @@ class CZIAnalyzerApp:
             self.image_label.config(image=img)
             self.image_label.image = img  # Prevent garbage collection
 
+    def _get_channel_count(self, entry_widget):
+        try:
+            return max(1, int(entry_widget.get()))
+        except ValueError:
+            return 1
+
+    def _build_channel_options(self, count):
+        return ["All channels"] + [f"Channel {i}" for i in range(1, count + 1)]
+
+    def _selection_to_index(self, selection):
+        if selection == "All channels":
+            return 0
+        if selection.startswith("Channel "):
+            try:
+                return int(selection.split(" ")[-1])
+            except ValueError:
+                return 0
+        return 0
+
+    def update_channel_comboboxes(self, event=None):
+        guv_options = self._build_channel_options(self._get_channel_count(self.GUV_channels))
+        dye_options = self._build_channel_options(self._get_channel_count(self.dye_channels))
+
+        self.ch_guv_combo.configure(values=guv_options)
+        self.ch_dye_combo.configure(values=dye_options)
+
+        if self.ch_guv_combo_var.get() not in guv_options:
+            self.ch_guv_combo_var.set("All channels")
+        if self.ch_dye_combo_var.get() not in dye_options:
+            self.ch_dye_combo_var.set("All channels")
+
+        self.GUVchannel = self._selection_to_index(self.ch_guv_combo_var.get())
+        self.dye_channel = self._selection_to_index(self.ch_dye_combo_var.get())
+
     def on_change_guv_channel(self, event):
-        if self.ch_guv_combo.get() == "All channels":
-            self.channel = 0
-        elif self.ch_guv_combo.get() == "Channel 1":
-            self.channel = 1
-        elif self.ch_guv_combo.get() == "Channel 2":
-            self.channel = 2
+        self.GUVchannel = self._selection_to_index(self.ch_guv_combo.get())
 
     def on_change_dye_channel(self, event):
-        if self.ch_dye_combo.get() == "All channels":
-            self.dye_channel = 0
-        elif self.ch_dye_combo.get() == "Channel 1":
-            self.dye_channel = 1
-        elif self.ch_dye_combo.get() == "Channel 2":
-            self.dye_channel = 2
+        self.dye_channel = self._selection_to_index(self.ch_dye_combo.get())
 
     #add file to list
     def add_file(self):
@@ -398,6 +425,7 @@ class CZIAnalyzerApp:
                 self.tree.delete(child)
 
         # Call analysis
+        self.update_channel_comboboxes()
         print("files", self.files)
         for file in self.files:
             print(f"Analyzing file {file} with thresholds: Mean={mean_threshold}, Lower Radius={circle_radius_lower}, Upper Radius={circle_radius_upper}")
@@ -410,25 +438,25 @@ class CZIAnalyzerApp:
                 if not self.tree.exists(sample_iid):
                     self.tree.insert(file, "end", iid=sample_iid, text=f"Sample {sample}")
 
-                for channel, dye_channels in channels.items():
-                    dye_intensities_sample[channel] = {}
+                for GUVchannel, dye_channels in channels.items():
+                    dye_intensities_sample[GUVchannel] = {}
 
-                    guv_channel_iid = f"guvchannel::{file}::{sample}::{channel}"
+                    guv_channel_iid = f"guvchannel::{file}::{sample}::{GUVchannel}"
                     if not self.tree.exists(guv_channel_iid):
-                        self.tree.insert(sample_iid, "end", iid=guv_channel_iid, text=f"GUV Channel {channel + 1}")
+                        self.tree.insert(sample_iid, "end", iid=guv_channel_iid, text=f"GUV Channel {GUVchannel + 1}")
 
                     for dye_channel, timepoints in dye_channels.items():
-                        dye_intensities_sample[channel][dye_channel] = {
+                        dye_intensities_sample[GUVchannel][dye_channel] = {
                             "average_intensity": timepoints,
-                            "individual_intensities": individual_GUV_dye_intensity_sample[sample][channel][dye_channel]
+                            "individual_intensities": individual_GUV_dye_intensity_sample[sample][GUVchannel][dye_channel]
                         }
 
-                        dye_channel_iid = f"dyechannel::{file}::{sample}::{channel}::{dye_channel}"
+                        dye_channel_iid = f"dyechannel::{file}::{sample}::{GUVchannel}::{dye_channel}"
                         if not self.tree.exists(dye_channel_iid):
                             self.tree.insert(guv_channel_iid, "end", iid=dye_channel_iid, text=f"Dye Channel {dye_channel + 1}")
 
                         for time, _ in enumerate(timepoints):
-                            time_item = f"time::{file}::{sample}::{channel}::{dye_channel}::{time}"
+                            time_item = f"time::{file}::{sample}::{GUVchannel}::{dye_channel}::{time}"
                             if not self.tree.exists(time_item):
                                 self.tree.insert(dye_channel_iid, "end", iid=time_item, text=f"Time {time}")
 
@@ -533,16 +561,22 @@ class CZIAnalyzerApp:
         images = {}
         dye_intensities = {}
 
-        selected_channels = range(len(image_ch_guv_list)) if self.channel == 0 else [self.channel - 1]
+        if self.GUVchannel == 0:
+            selected_guv_channels = range(len(image_ch_guv_list))
+        else:
+            selected_guv_channels = [self.GUVchannel - 1] if 0 <= self.GUVchannel - 1 < len(image_ch_guv_list) else []
 
         print("processing circles")
-        for channel in selected_channels:
-            image_ch_guv = image_ch_guv_list[channel]
-            selected_dye_channels = range(len(image_ch_dye_list[channel])) if self.dye_channel == 0 else [self.dye_channel - 1]
-            print("processing channel =", channel)
+        for GUVchannel in selected_guv_channels:
+            image_ch_guv = image_ch_guv_list[GUVchannel]
+            if self.dye_channel == 0:
+                selected_dye_channels = range(len(image_ch_dye_list[GUVchannel]))
+            else:
+                selected_dye_channels = [self.dye_channel - 1] if 0 <= self.dye_channel - 1 < len(image_ch_dye_list[GUVchannel]) else []
+            print("processing channel =", GUVchannel)
 
             for dye_channel in selected_dye_channels:
-                image_ch_dye = image_ch_dye_list[channel][dye_channel]
+                image_ch_dye = image_ch_dye_list[GUVchannel][dye_channel]
 
                 for s in range(image_ch_guv.shape[0]):
                     print("processing S =", s)
@@ -550,10 +584,10 @@ class CZIAnalyzerApp:
                         dye_intensity_avg[s] = {}
                         images[s] = {}
                         dye_intensities[s] = {}
-                    if channel not in dye_intensity_avg[s]:
-                        dye_intensity_avg[s][channel] = {}
-                        images[s][channel] = {}
-                        dye_intensities[s][channel] = {}
+                    if GUVchannel not in dye_intensity_avg[s]:
+                        dye_intensity_avg[s][GUVchannel] = {}
+                        images[s][GUVchannel] = {}
+                        dye_intensities[s][GUVchannel] = {}
 
                     dye_intensity_avg_sample = []
                     images_sample = {}
@@ -650,9 +684,9 @@ class CZIAnalyzerApp:
 
                         plt.close(fig)
 
-                    dye_intensity_avg[s][channel][dye_channel] = dye_intensity_avg_sample
-                    images[s][channel][dye_channel] = images_sample
-                    dye_intensities[s][channel][dye_channel] = dye_intensities_sample
+                    dye_intensity_avg[s][GUVchannel][dye_channel] = dye_intensity_avg_sample
+                    images[s][GUVchannel][dye_channel] = images_sample
+                    dye_intensities[s][GUVchannel][dye_channel] = dye_intensities_sample
 
         return dye_intensity_avg, images, dye_intensities
 
