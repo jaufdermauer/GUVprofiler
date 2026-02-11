@@ -10,8 +10,60 @@ from PIL import Image, ImageTk
 import json
 import os
 import time
+from matplotlib.colors import PowerNorm
+import faulthandler, sys
+faulthandler.enable(all_threads=True)
+# optional: in eine Datei loggen
+faulthandler.enable(open("crash.log", "w"), all_threads=True)
 
 np.set_printoptions(threshold=np.inf, linewidth=200)
+
+def bbox_to_region(box):
+    # Case 1: box hat x, y, w, h
+    for attrs in [("x", "y", "w", "h"), ("X", "Y", "W", "H")]:
+        if all(hasattr(box, a) for a in attrs):
+            x, y, w, h = (int(getattr(box, a)) for a in attrs)
+            return (x, y, w, h)
+
+    # Case 2: box hat left, top, right, bottom
+    for attrs in [("left", "top", "right", "bottom"), ("Left", "Top", "Right", "Bottom")]:
+        if all(hasattr(box, a) for a in attrs):
+            l, t, r, b = (int(getattr(box, a)) for a in attrs)
+            return (l, t, r - l, b - t)
+
+    # Case 3: box hat x0, y0, x1, y1
+    for attrs in [("x0", "y0", "x1", "y1"), ("X0", "Y0", "X1", "Y1")]:
+        if all(hasattr(box, a) for a in attrs):
+            x0, y0, x1, y1 = (int(getattr(box, a)) for a in attrs)
+            return (x0, y0, x1 - x0, y1 - y0)
+
+    raise TypeError(f"Don't know how to convert BBox to region. Got: {box} with attrs {dir(box)}")
+
+def pad_to(arr, tx, ty):
+    x, y = arr.shape[-2], arr.shape[-1]
+    pad = [(0,0)] * arr.ndim
+    pad[-2] = (0, tx - x)
+    pad[-1] = (0, ty - y)
+    return np.pad(arr, pad, mode="constant", constant_values=0)
+
+def to_stxy(imgs_st):
+    """
+    imgs_st: nested list imgs_st[s][t] -> np.ndarray with shape (1,1,x,y) (as you showed)
+    returns: np.ndarray (s,t,x,y) padded to max_x/max_y across all frames in this imgs_st
+    """
+    max_x = max(imgs_st[s][t].shape[-2] for s in range(len(imgs_st)) for t in range(len(imgs_st[s])))
+    max_y = max(imgs_st[s][t].shape[-1] for s in range(len(imgs_st)) for t in range(len(imgs_st[s])))
+
+    out_s = []
+    for s in range(len(imgs_st)):
+        out_t = []
+        for t in range(len(imgs_st[s])):
+            a = pad_to(imgs_st[s][t], max_x, max_y)
+            a2d = a[0, 0, :, :]          # (1,1,x,y) -> (x,y)
+            out_t.append(a2d)
+        out_s.append(np.stack(out_t, axis=0))  # (t,x,y)
+
+    return np.stack(out_s, axis=0)            # (s,t,x,y)
 
 # Class to create the GUI
 class CZIAnalyzerApp:
@@ -19,11 +71,10 @@ class CZIAnalyzerApp:
         self.root = root
         self.root.title("GUV profiler for CZI and TIF files")
         self.files = []
-        self.green_intensity_results = {}
+        self.dye_intensity_results = {}
         self.image_results = {}
         self._last_width = None
         self._last_height = None
-
         self.root.minsize(800, 600)
         self.root.bind("<Configure>", self.on_resize)
         self.channel = 1
@@ -35,18 +86,15 @@ class CZIAnalyzerApp:
         if match:
             return int(match.group(1))
         return None  # falls keine Zahl gefunden wird
-
+    
     # Resizes the image when the window size changes, with debouncing.
     def on_resize(self, event):
-        selected_items = self.tree.selection()
-        if selected_items and hasattr(self.image_label, "image") and self.image_label.image is not None:
-            selected_item = selected_items[0]
-            parent = self.tree.parent(selected_item)
-
-            if parent:  # A specific time point is selected
-                file = parent
-                time_point = selected_item.split("_")[-1]  # Hier "time" in "time_point" geändert
-
+        selected = self.tree.selection()
+        if selected and hasattr(self.image_label, "image") and self.image_label.image is not None:
+            iid = selected[0]
+            kind = iid.split("::", 1)[0]  # "file" | "sample" | "time"
+            if kind == "time":
+                _, file_, sample, time_point = iid.split("::")  # ["time", file, sample, t]
                 # Prevent frequent updates using debouncing
                 current_time = time.time()
                 if hasattr(self, "_last_resize_time"):
@@ -64,8 +112,8 @@ class CZIAnalyzerApp:
                 self._last_width = new_width
                 self._last_height = new_height
 
-                self.show_image(file, time_point)
-
+                self.show_image(file_, sample, time_point)
+    ""
     def create_widgets(self):
         # Left side: all UI elements except the image
         left_frame = tk.Frame(self.root)
@@ -88,86 +136,105 @@ class CZIAnalyzerApp:
         self.tree_scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=self.tree_scrollbar.set)
 
-        # Button to add files
+        # Image properties
         i_row = 0
-        self.add_file_button = tk.Button(middle_frame, text="Add file", command=self.add_file)
-        self.add_file_button.grid(row=i_row, column=0, padx=10, pady=10, sticky="ew")
+        self.threshold_label = tk.Label(middle_frame, text="Image input:")
+        self.threshold_label.grid(row=i_row, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         i_row+=1
+
+        self.GUV_channels_label = tk.Label(middle_frame, text="Number of GUV channels:")
+        self.GUV_channels_label.grid(row=i_row, column=0, padx=5, pady=5, sticky="ew")
+
+        self.GUV_channels = tk.Entry(middle_frame)
+        self.GUV_channels.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
+        self.GUV_channels.insert(0, "2")
+        i_row+=1
+
+        self.dye_channels_label = tk.Label(middle_frame, text="Number of dye channels:")
+        self.dye_channels_label.grid(row=i_row, column=0, padx=5, pady=5, sticky="ew")
+
+        self.dye_channels = tk.Entry(middle_frame)
+        self.dye_channels.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
+        self.dye_channels.insert(0, "1")
+        i_row+=1
+
+        # Button to add files
+        self.add_file_button = tk.Button(middle_frame, text="Add file", command=self.add_file)
+        self.add_file_button.grid(row=i_row, column=0, columnspan=2, padx=7, pady=10, sticky="ew")
+        i_row+=1
+
         # Threshold inputs for analysis
         self.threshold_label = tk.Label(middle_frame, text="Threshold input:")
-        self.threshold_label.grid(row=i_row, column=0, padx=10, pady=10, sticky="ew")
+        self.threshold_label.grid(row=i_row, column=0, padx=2, pady=10, sticky="ew")
         i_row+=1
 
         self.mean_intensity_label = tk.Label(middle_frame, text="Maximum lipid dye intensity inside GUV:")
-        self.mean_intensity_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.mean_intensity_label.grid(row=i_row, column=0, padx=17, pady=5, sticky="ew")
 
         self.mean_intensity_entry = tk.Entry(middle_frame)
-        self.mean_intensity_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.mean_intensity_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.mean_intensity_entry.insert(0, "100")
         i_row+=1
 
         self.circle_radius_lower_label = tk.Label(middle_frame, text="Circle Radius lower Threshold:")
-        self.circle_radius_lower_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.circle_radius_lower_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
 
         self.circle_radius_lower_entry = tk.Entry(middle_frame)
-        self.circle_radius_lower_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.circle_radius_lower_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.circle_radius_lower_entry.insert(0, "5")
         i_row+=1
 
         self.circle_radius_upper_label = tk.Label(middle_frame, text="Circle Radius upper Threshold:")
-        self.circle_radius_upper_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.circle_radius_upper_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
 
         self.circle_radius_upper_entry = tk.Entry(middle_frame)
-        self.circle_radius_upper_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.circle_radius_upper_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.circle_radius_upper_entry.insert(0, "50")
         i_row+=1
 
         self.circle_param2_label = tk.Label(middle_frame, text="Detection sensitivity:")
-        self.circle_param2_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.circle_param2_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
+
         self.circle_param2_entry = tk.Entry(middle_frame)
-        self.circle_param2_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.circle_param2_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.circle_param2_entry.insert(0, "50")
         i_row+=1
 
         self.circle_radius_distance_tolerance_label = tk.Label(middle_frame, text="Circle radius tolerance:")
-        self.circle_radius_distance_tolerance_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.circle_radius_distance_tolerance_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
+
         self.circle_radius_distance_tolerance_entry = tk.Entry(middle_frame)
-        self.circle_radius_distance_tolerance_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.circle_radius_distance_tolerance_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.circle_radius_distance_tolerance_entry.insert(0, "0.9")
         i_row+=1
 
         self.center_distance_tolerance_abs_label = tk.Label(middle_frame, text="Circle distance tolerance (absolute):")
-        self.center_distance_tolerance_abs_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.center_distance_tolerance_abs_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
+
         self.center_distance_tolerance_abs_entry = tk.Entry(middle_frame)
-        self.center_distance_tolerance_abs_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.center_distance_tolerance_abs_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.center_distance_tolerance_abs_entry.insert(0, "15")
         i_row+=1
 
-        self.center_distance_tolerance_rel_label = tk.Label(middle_frame, text="Circle distance tolerance (relative to GUV size):")
-        self.center_distance_tolerance_rel_label.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
-        i_row+=1
+        self.center_distance_tolerance_rel_label = tk.Label(middle_frame, text="Circle distance tolerance / GUV size:")
+        self.center_distance_tolerance_rel_label.grid(row=i_row, column=0, padx=7, pady=5, sticky="ew")
+
         self.center_distance_tolerance_rel_entry = tk.Entry(middle_frame)
-        self.center_distance_tolerance_rel_entry.grid(row=i_row, column=0, padx=10, pady=5, sticky="ew")
+        self.center_distance_tolerance_rel_entry.grid(row=i_row, column=1, padx=2, pady=5, sticky="ew")
         self.center_distance_tolerance_rel_entry.insert(0, "0.1")
         i_row+=1
 
         options = ["Channel 1", "Channel 2"]
-        self.combo = ttk.Combobox(root, values=options, state="readonly")  # optional: state="readonly"
-        self.combo_var = tk.StringVar(value="Channel 1")
-        self.combo = ttk.Combobox(root, textvariable=self.combo_var, values=options, state="readonly")
-        self.combo.bind("<<ComboboxSelected>>", self.onChangeChannel)
-        self.combo.grid(row=i_row, column=0, padx=10, pady=10)
+        self.ch_guv_combo = ttk.Combobox(root, values=options, state="readonly")  # optional: state="readonly"
+        self.ch_guv_combo_var = tk.StringVar(value="Channel 1")
+        self.ch_guv_combo = ttk.Combobox(root, textvariable=self.ch_guv_combo_var, values=options, state="readonly")
+        self.ch_guv_combo.bind("<<ComboboxSelected>>", self.onChangeChannel)
+        self.ch_guv_combo.grid(row=i_row, column=0, padx=10, pady=10)
         i_row+=1
 
         # Button for analysis
         self.analyze_button = tk.Button(middle_frame, text="Analyze", command=self.analyze_files)
-        self.analyze_button.grid(row=i_row, column=0, padx=10, pady=20, sticky="ew")
+        self.analyze_button.grid(row=i_row, column=0, columnspan=2, padx=10, pady=20, sticky="ew")
         i_row+=1
 
         # Right side - image display
@@ -200,22 +267,41 @@ class CZIAnalyzerApp:
 
     #Event handler when an item is selected in the TreeView
     def on_tree_select(self, event):
-        selected_item = self.tree.selection()[0]
-        parent = self.tree.parent(selected_item)
+        selected = self.tree.selection()
+        if not selected:
+            return
+        iid = selected[0]
 
-        if parent:  # A specific time point is selected
-            file = parent
-            time = selected_item.split("_")[-1]
-            intensity = self.green_intensity_results[file]["average_intensity"][int(time)]
-            self.show_image(file, time)
-        else:
-            print(f"File {selected_item} selected")
+        kind = iid.split("::", 1)[0]  # "file" | "sample" | "time"
+
+        if kind == "time":
+            # time -> sample -> file
+            print("timepoint selected")
+            sample_iid = self.tree.parent(iid)
+            file_iid = self.tree.parent(sample_iid)
+
+            _, file_, sample, t = iid.split("::")  # ["time", file, sample, t]
+            t = int(t)
+            intensity = self.dye_intensity_results[file_][int(sample)]["average_intensity"][t]
+            print("file_", file_)
+            self.show_image(file_, sample, t)
+
+        elif kind == "sample":
+            # sample clicked
+            _, file_, sample = iid.split("::")
+            sample = int(sample)
+            print(f"Sample {sample} in file {file_} selected")
+
+        elif kind == "file":
+            _, file_ = iid.split("::")
+            print(f"File {file_} selected")
 
     # Displays the saved image for the selected file and time
-    def show_image(self, file, time):
+    def show_image(self, file, sample, time):
         selected_time_point = int(time)
-        if file in self.image_results and selected_time_point in self.image_results[file]:
-            image = self.image_results[file][selected_time_point]
+        sample = int(sample)
+        if file in self.image_results and sample in self.image_results[file] and selected_time_point in self.image_results[file][sample]:
+            image = self.image_results[file][sample][selected_time_point]
             img = Image.fromarray(image)
 
             # Wait until the label is visible to get the correct size
@@ -245,11 +331,10 @@ class CZIAnalyzerApp:
             self.image_label.config(image=img)
             self.image_label.image = img  # Prevent garbage collection
 
-    
     def onChangeChannel(self, event):
-        if self.combo.get() == "Channel 1":
+        if self.ch_guv_combo.get() == "Channel 1":
             self.channel = 1
-        elif self.combo.get() == "Channel 2":
+        elif self.ch_guv_combo.get() == "Channel 2":
             self.channel = 2
 
     #add file to list
@@ -284,17 +369,23 @@ class CZIAnalyzerApp:
         print("files", self.files)
         for file in self.files:
             print(f"Analyzing file {file} with thresholds: Mean={mean_threshold}, Lower Radius={circle_radius_lower}, Upper Radius={circle_radius_upper}")
-            green_intensity, images, individual_GUV_green_intensity = self.process_file(file, mean_threshold, circle_param2, circle_radius_lower, circle_radius_upper)
-            green_intensities_file = {}
-            green_intensities_file["average_intensity"] = green_intensity
-            green_intensities_file["individual_intensities"] = individual_GUV_green_intensity
-            self.green_intensity_results[file] = green_intensities_file
-            self.image_results[file] = images  # Save images for files here
-            for time, intensity in enumerate(green_intensity):
-                time_item = f"{file}_{time}"
-                # Prevent double entries
-                if not self.tree.exists(time_item):
-                    self.tree.insert(file, "end", f"{file}_{time}", text=f"Time {time}")
+            dye_intensity_sample, images_sample, individual_GUV_dye_intensity_sample = self.process_file(file, mean_threshold, circle_param2, circle_radius_lower, circle_radius_upper)            
+            dye_intensities_file = {}
+            for sample, _ in enumerate(dye_intensity_sample):
+                dye_intensities_sample = {}
+                dye_intensities_sample["average_intensity"] = dye_intensity_sample[sample]
+                dye_intensities_sample["individual_intensities"] = individual_GUV_dye_intensity_sample[sample]
+                dye_intensities_file[sample] = dye_intensities_sample
+                sample_iid = f"sample::{file}::{sample}"
+                if not self.tree.exists(sample_iid):
+                    self.tree.insert(file, "end", iid=sample_iid, text=f"Sample {sample}")
+                for time, intensity in enumerate(dye_intensity_sample[0]):
+                    time_item = f"time::{file}::{sample}::{time}"
+                    # Prevent double entries
+                    if not self.tree.exists(time_item):
+                        self.tree.insert(sample_iid, "end", f"time::{file}::{sample}::{time}", text=f"Time {time}")
+            self.dye_intensity_results[file] = dye_intensities_file
+            self.image_results[file] = images_sample  # Save images for files here
         messagebox.showinfo("Done", "Analysis completed!")
         self.plot_results()
 
@@ -304,32 +395,58 @@ class CZIAnalyzerApp:
         print(filename)
         if filename.endswith(".czi"):
             czi = CziFile(filename)
+            print(czi)
 
             dims_info = czi.get_dims_shape()
             print("All Scene Dims:", dims_info)
 
             # Wir nehmen Scene 0 (aber NICHT bei read_mosaic verwenden!)
             scene_dims = dims_info[0]
-            T = scene_dims['T'][1] - scene_dims['T'][0]
-            C = scene_dims['C'][1] - scene_dims['C'][0]
+            print(scene_dims)
+            if "T" in scene_dims:
+                T = scene_dims['T'][1] - scene_dims['T'][0]
+            if "C" in scene_dims:
+                C = scene_dims['C'][1] - scene_dims['C'][0]
+            if "S" in scene_dims:
+                S = scene_dims['S'][1] - scene_dims['S'][0]
+            else:
+                S = 1
+            if "M" in scene_dims:
+                M = scene_dims['M'][1] - scene_dims['M'][0]
+            else:
+                M = 1
 
             print("Dims:", list(scene_dims.keys()))
             print("Shape:", {k: v[1] - v[0] for k, v in scene_dims.items()})
 
-            image_ch0_list = []
-            image_ch1_list = []
+            image_ch_guv_list = []
+            image_ch_dye_list = []
+            for guv in range(int(self.GUV_channels.get())):
+                image_ch_guv_scene = []
+                image_ch_dye_scene = []
+                for scene in range(S):
+                    image_ch_guv_time = []
+                    image_ch_dye_time = []
+                    for t in range(T):
+                        if "S" in scene_dims and "M" in scene_dims and S > 1: #write exception for either being != 1
+                            scene_boxes = czi.get_all_mosaic_scene_bounding_boxes()
+                            region = bbox_to_region(scene_boxes[scene])
+                            image_ch_guv_time.append(czi.read_mosaic(region=region, C=guv, T=t))
+                            image_ch_dye_time.append(czi.read_mosaic(region=region, C=int(self.GUV_channels.get())+int(self.dye_channels.get())-1, T=t))
+                        else:
+                            image_ch_guv_time.append(czi.read_mosaic(C=guv, T=t))
+                            image_ch_dye_time.append(czi.read_mosaic(C=int(self.GUV_channels.get())+int(self.dye_channels.get())-1, T=t))
+                    image_ch_guv_scene.append(image_ch_guv_time)
+                    image_ch_dye_scene.append(image_ch_dye_time)
+                image_ch_guv_list.append(image_ch_guv_scene)
+                image_ch_dye_list.append(image_ch_dye_scene)
+                print("Channel evaluated:", guv)
 
-            for t in range(T):
-                image_ch0_list.append(czi.read_mosaic(C=0, T=t))
-                try:
-                    image_ch1_list.append(czi.read_mosaic(C=self.channel, T=t))
-                    print("Channel evaluated:", channel)
-                except:
-                    print("Kein gültiger Channel")
+            image_ch_guv = to_stxy(image_ch_guv_list[self.channel-1])
+            image_ch_dye = to_stxy(image_ch_dye_scene)
 
-            image_ch0 = np.stack(image_ch0_list, axis=0)[0, 0, :, :]
-            image_ch1 = np.stack(image_ch1_list, axis=0)[0, 0, :, :]
-
+            #image_ch_guv = np.stack(image_ch_guv_list[self.channel-1], axis=0)[:,:,0, 0, :, :] #s,t,?,?,x,y
+            #image_ch_dye = np.stack(, axis=0)[:,:,0, 0, :, :] #fill out later with dual channel GUV+DYE
                 
         elif filename.endswith("tif") or filename.endswith("tiff") or filename.endswith("TIF") or filename.endswith("TIFF"):
             image_ch0_list = []
@@ -337,119 +454,131 @@ class CZIAnalyzerApp:
 
             print(tifffile.imread(filename).shape)
 
-            
             image_ch0_list.append(tifffile.imread(filename)[0])
             try:
                 image_ch1_list.append(tifffile.imread(filename)[self.channel])
-                print("Channel evaluated TIF:", channel)
+                print("Channel evaluated TIF:", self.channel)
             except:
-                print("Kein gültiger Channel TIF")
+                print("No valid Channel TIF")
 
-            image_ch0 = np.stack(image_ch0_list, axis=0)
-            image_ch1 = np.stack(image_ch1_list, axis=0)
-        green_intensity_avg = []
+        dye_intensity_avg = []
         images = {}
-        green_intensities = {}
+        dye_intensities = {}
 
-        for t in range(image_ch0.shape[0]):
-            # Variables for green intensity signal
-            green_intensity_sum = 0
-            valid_circles_count = 0
-            green_intensities_time = []
-            blur = cv2.GaussianBlur(image_ch0[t], (5,5), 0)
-            dst = cv2.normalize(blur, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        print("processing circles")
+        for s in range(image_ch_guv.shape[0]):
+            print("processing S =",s)
+            dye_intensity_avg_sample = []
+            images_sample = {}
+            dye_intensities_sample = {}
+            for t in range(image_ch_guv.shape[1]):
+                print("processing t =",t)
+                # Variables for dye intensity signal
+                dye_intensity_sum = 0
+                valid_circles_count = 0
+                dye_intensities_time = []
+                blur = cv2.GaussianBlur(image_ch_guv[s][t], (5,5), 0)
+                dst = cv2.normalize(blur, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
 
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            dst = clahe.apply(dst)
-            dst_circles = dst
-            dst_circles[dst_circles<40] = 0
-            print(dst.shape)
-            fig, ax = plt.subplots(2, 2, figsize=(3,3), dpi=600)
-            ax[1][1].imshow(dst, cmap='gray')
-            for ax1 in ax:
-                for ax2 in ax1:
-                    ax2.set_axis_off()
-                    ax2.axis("off")
-            circles = cv2.HoughCircles(dst_circles, cv2.HOUGH_GRADIENT, dp=1.2, minDist=10,
-                                    param1=50, param2=circle_param2, minRadius=circle_radius_lower, maxRadius=circle_radius_upper)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                dst = clahe.apply(dst)
 
-            # If there are circles
-            CRD_tolerance = float(self.circle_radius_distance_tolerance_entry.get())
-            CDTabs_tolerance = float(self.center_distance_tolerance_abs_entry.get())
-            CDTrel_tolerance = float(self.center_distance_tolerance_rel_entry.get())
+                #threshold image with otsu to remove noise
+                img8 = cv2.normalize(dst, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                thr, mask = cv2.threshold(img8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                dst_circles = dst.copy()
+                dst_circles[dst<thr] = 0
 
-            valid_circles = []
-            whole_mask = np.zeros_like(dst)
-            if circles is not None:
-                circles = np.round(circles[0, :]).astype("int")
+                #print(dst.shape)
+                fig, ax = plt.subplots(2, 2, figsize=(3,3), dpi=600)
+                ax[1][1].imshow(dst, cmap='gray')
+                for ax1 in ax:
+                    for ax2 in ax1:
+                        ax2.set_axis_off()
+                        ax2.axis("off")
+                circles = cv2.HoughCircles(dst_circles, cv2.HOUGH_GRADIENT, dp=1.2, minDist=10,
+                                        param1=50, param2=circle_param2, minRadius=circle_radius_lower, maxRadius=circle_radius_upper)
 
-        
-                # Check and plot circles
-                for i, (x, y, r) in enumerate(circles):
-                    # Mask for circle
-                    circle_mask = np.zeros_like(dst)
-                    cv2.circle(circle_mask, (x, y), int(r*CRD_tolerance)-3, 255, thickness=cv2.FILLED)
+                # If there are circles
+                CRD_tolerance = float(self.circle_radius_distance_tolerance_entry.get())
+                CDTabs_tolerance = float(self.center_distance_tolerance_abs_entry.get())
+                CDTrel_tolerance = float(self.center_distance_tolerance_rel_entry.get())
 
-                    overlaps_with_any = False
+                valid_circles = []
+                whole_mask = np.zeros_like(dst)
+                if circles is not None:
+                    circles = np.round(circles[0, :]).astype("int")
 
-                    # Check for overlap between circles
-                    for j, (other_x, other_y, other_r) in enumerate(circles):
-                        if i == j:
-                            continue
-
-                        center_distance = np.sqrt((x - other_x) ** 2 + (y - other_y) ** 2)
-                        radius_diff = r - other_r
-                        if center_distance < CDTabs_tolerance + CDTrel_tolerance*r and np.abs(radius_diff < CDTabs_tolerance + CDTrel_tolerance*r) and radius_diff < 0:
-                            print("ring detected")
-                        elif center_distance < (r + other_r)*CRD_tolerance:
-                            overlaps_with_any = True
-                            break
-
-                    if not overlaps_with_any:
-                        whole_mask = cv2.bitwise_or(whole_mask, circle_mask)
-
-                        # Calculate intensity within circles
-                        mean_intensity = cv2.mean(dst, mask=circle_mask)[0]
-                        ax[1][1].add_patch(plt.Circle((x, y), r + 10, color='green', fill=False, linewidth=0.2))
-                        if mean_intensity < mean_threshold:
-                            valid_circles.append((x, y, r))
-                            ax[1][1].add_patch(plt.Circle((x, y), r - 3, color='red', fill=False, linewidth=0.2))
-
-                            # Add green intensity to buffer dict
-                            intensity_buffer = round(cv2.mean(image_ch1[t], mask=circle_mask)[0] * 100 / cv2.mean(image_ch1[t])[0],2)
-                            if intensity_buffer > 100:
-                                intensity_buffer = 100
-                            green_intensity_sum += intensity_buffer
-                            green_intensities_time.append(intensity_buffer)
-                            valid_circles_count += 1
-
-                    ax[1][0].add_patch(plt.Circle((x, y), r, color='green', fill=False, linewidth=0.4))
-
-                # Normalize and add to green_intensity_avg
-                if valid_circles_count > 0:
-                    normalized_intensity = green_intensity_sum / valid_circles_count
-                    green_intensity_avg.append(normalized_intensity)
-                else:
-                    green_intensity_avg.append(0)  # If no circles are found
-            else:
-                green_intensity_avg.append(0)  # If no circles are found
             
+                    # Check and plot circles
+                    for i, (x, y, r) in enumerate(circles):
+                        # Mask for circle
+                        circle_mask = np.zeros_like(dst)
+                        cv2.circle(circle_mask, (x, y), int(r*CRD_tolerance)-3, 255, thickness=cv2.FILLED)
+
+                        overlaps_with_any = False
+
+                        # Check for overlap between circles
+                        for j, (other_x, other_y, other_r) in enumerate(circles):
+                            if i == j:
+                                continue
+
+                            center_distance = np.sqrt((x - other_x) ** 2 + (y - other_y) ** 2)
+                            radius_diff = r - other_r
+                            if center_distance < CDTabs_tolerance + CDTrel_tolerance*r and np.abs(radius_diff < CDTabs_tolerance + CDTrel_tolerance*r) and radius_diff < 0:
+                                #print("ring detected")
+                                continue
+                            elif center_distance < (r + other_r)*CRD_tolerance:
+                                overlaps_with_any = True
+                                break
+
+                        if not overlaps_with_any:
+                            whole_mask = cv2.bitwise_or(whole_mask, circle_mask)
+
+                            # Calculate intensity within circles
+                            mean_intensity = cv2.mean(dst, mask=circle_mask)[0]
+                            ax[1][1].add_patch(plt.Circle((x, y), r + 10, color='green', fill=False, linewidth=0.2))
+                            if mean_intensity < mean_threshold:
+                                valid_circles.append((x, y, r))
+                                ax[1][1].add_patch(plt.Circle((x, y), r - 3, color='red', fill=False, linewidth=0.2))
+
+                                # Add dye intensity to buffer dict
+                                intensity_buffer = round(cv2.mean(image_ch_dye[s][t], mask=circle_mask)[0] * 100 / cv2.mean(image_ch_dye[s][t])[0],2)
+                                if intensity_buffer > 100:
+                                    intensity_buffer = 100
+                                dye_intensity_sum += intensity_buffer
+                                dye_intensities_time.append(intensity_buffer)
+                                valid_circles_count += 1
+
+                        ax[1][0].add_patch(plt.Circle((x, y), r, color='green', fill=False, linewidth=0.4))
+
+                    # Normalize and add to dye_intensity_avg
+                    if valid_circles_count > 0:
+                        normalized_intensity = dye_intensity_sum / valid_circles_count
+                        dye_intensity_avg_sample.append(normalized_intensity)
+                    else:
+                        dye_intensity_avg_sample.append(0)  # If no circles are found
+                else:
+                    dye_intensity_avg_sample.append(0)  # If no circles are found
+                
+                ax[0][0].imshow(dst_circles>0, cmap="gray")
+                ax[1][0].imshow(dst, cmap='gray')
+                ax[0][1].imshow(whole_mask, cmap='gray')
+
+                # Save figure in dictionary
+                plt.subplots_adjust(wspace=0.01, hspace=0.01, left=0, right=1, top=1, bottom=0)
+                fig.canvas.draw()
+                img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                images_sample[t] = img
+                dye_intensities_sample[t] = dye_intensities_time
+
+                plt.close(fig)  # Close figure to save memory
+            dye_intensity_avg.append(dye_intensity_avg_sample)
+            images[s] = images_sample
+            dye_intensities[s] = dye_intensities_sample
             print("show images")
-            ax[0][0].imshow(dst, cmap='gray')
-            ax[1][0].imshow(dst, cmap='gray')
-            ax[0][1].imshow(whole_mask, cmap='gray')
-
-            # Save figure in dictionary
-            plt.subplots_adjust(wspace=0.01, hspace=0.01, left=0, right=1, top=1, bottom=0)
-            fig.canvas.draw()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            images[t] = img
-            green_intensities[t] = green_intensities_time
-
-            plt.close(fig)  # Close figure to save memory
-
-        return green_intensity_avg, images, green_intensities
+        return dye_intensity_avg, images, dye_intensities
 
     # SHow results in a plot
     def plot_results(self):
@@ -481,15 +610,19 @@ class CZIAnalyzerApp:
         
         #export dict as json
         exportpath = os.path.dirname(self.files[0])
-        with open(exportpath + "/data.json", "w") as json_file:
-            json.dump(self.green_intensity_results, json_file, indent=4)
+        with open(exportpath + "/data_" + self.ch_guv_combo.get() + ".json", "w") as json_file:
+            json.dump(self.dye_intensity_results, json_file, indent=4)
 
         # Plot for every file
-        for file, intensity in self.green_intensity_results.items():
-            label = file.split("/")[-1]
-            ax.plot(time_points[:len(intensity["average_intensity"])], intensity["average_intensity"], label=label, marker="o")
+        print(self.dye_intensity_results)
+        for name, file in self.dye_intensity_results.items():
+            print(file)
+            for _, intensity in file.items():
+                print(intensity)
+                label = name.split("/")[-1]
+                ax.plot(time_points[:len(intensity["average_intensity"])], intensity["average_intensity"], label=label, marker="o")
 
-        ax.legend(loc='center left', bbox_to_anchor=(1, 0.8), title="Peptide", frameon=False)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.8), title="File:", frameon=False)
         fig.tight_layout()
         plt.show()
 

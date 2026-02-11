@@ -63,3 +63,8 @@ How to use the script for batch analysis:
     Press add file and select files to be analyzed
     Specify all parameters such that they fit well to your experiment
     Press analyze
+    After analysis is done, select timepoint on treeview, images of GUVs should appear:
+      top left: raw image of GUVs
+      top right: GUV binary mask
+      lower left: green circles with detected GUVs
+      lower right: red circles with accepted GUVs that are not stacked and have sufficiently low membrane intensity according to threshold
